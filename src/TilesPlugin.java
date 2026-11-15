@@ -357,8 +357,9 @@ public class TilesPlugin extends Plugin {
     JSpinner brick = spinner(prefs.getDouble("brickPct", 0), 0, 99, 5);
     JSpinner offX = spinner(prefs.getDouble("offX", 0), -1000, 1000, 1);
     JSpinner offY = spinner(prefs.getDouble("offY", 0), -1000, 1000, 1);
-    JComboBox<String> layoutRot = new JComboBox<String>(new String [] {"0° (horizontal rows)", "90° (vertical rows)"});
-    layoutRot.setSelectedIndex(prefs.getInt("layoutRot", 0) == 1 ? 1 : 0);
+    JComboBox<String> layoutRot = new JComboBox<String>(new String [] {
+        "Straight, horizontal rows", "Straight, vertical rows", "Diagonal (45°, karo)"});
+    layoutRot.setSelectedIndex(Math.max(0, Math.min(2, prefs.getInt("layoutRot", 0))));
 
     final Color [] groutHolder = {new Color(prefs.getInt("groutColor", 0x9A9A9A))};
     JButton groutBtn = colorButton(groutHolder);
@@ -373,10 +374,10 @@ public class TilesPlugin extends Plugin {
     p.add(new JLabel("Tile height (cm)")); p.add(tileH);
     p.add(new JLabel("Grout width (mm)")); p.add(grout);
     p.add(new JLabel("Grout color")); p.add(groutBtn);
-    p.add(new JLabel("Brick row shift (% of tile, 0 = straight)")); p.add(brick);
+    p.add(new JLabel("Brick row shift (% of tile, 0 = straight; not for diagonal)")); p.add(brick);
     p.add(new JLabel("Start offset X (cm)")); p.add(offX);
     p.add(new JLabel("Start offset Y (cm)")); p.add(offY);
-    p.add(new JLabel("Layout rotation")); p.add(layoutRot);
+    p.add(new JLabel("Layout")); p.add(layoutRot);
     p.add(wallLeft); p.add(wallRight);
     p.add(floorBox); p.add(new JLabel(""));
 
@@ -403,8 +404,10 @@ public class TilesPlugin extends Plugin {
     Color groutColor = groutHolder[0];
     double groutCm = val(grout) / 10.0;
     double brickFrac = val(brick) / 100.0;
-    boolean rotateLayout = layoutRot.getSelectedIndex() == 1;
-    String suffix = " grout " + val(grout) + "mm" + (brickFrac > 0 ? " brick " + (int)val(brick) + "%" : "");
+    final int layout = layoutRot.getSelectedIndex(); // 0 horizontal, 1 vertical, 2 diagonal
+    boolean rotateLayout = layout == 1;
+    String suffix = " grout " + val(grout) + "mm"
+        + (layout == 2 ? " diagonal" : (brickFrac > 0 ? " brick " + (int)val(brick) + "%" : ""));
 
     Map<Origin, HomeTexture> cache = new IdentityHashMap<Origin, HomeTexture>();
     int count = 0;
@@ -426,8 +429,14 @@ public class TilesPlugin extends Plugin {
             throw new IOException("Unsupported tile image format");
           }
           double [] sizeCm = new double [2];
-          BufferedImage image = buildTexture(tileImg, tw, th, groutCm, groutColor,
-              brickFrac, val(offX), val(offY), rotateLayout, sizeCm);
+          BufferedImage image;
+          if (layout == 2) {
+            image = buildDiagonalTexture(tileImg, tw, th, groutCm, groutColor,
+                val(offX), val(offY), sizeCm);
+          } else {
+            image = buildTexture(tileImg, tw, th, groutCm, groutColor,
+                brickFrac, val(offX), val(offY), rotateLayout, sizeCm);
+          }
 
           Map<String, String> text = new LinkedHashMap<String, String>();
           text.put(KEY_W, Double.toString(origin.wCm));
@@ -508,6 +517,102 @@ public class TilesPlugin extends Plugin {
   }
 
   // ---------------------------------------------------------------- texture generation
+
+  /**
+   * Diagonal ("karo") layout: tiles rotated by 45 degrees.
+   * The 45-degree tile lattice repeats on an axis-aligned square of side sqrt(2) * p * cw,
+   * where (tile height + grout) / (tile width + grout) = p / q for small integers p, q
+   * (1:1 squares, 1:2, 2:3 ... within 1%). Rendered at 2x and downscaled for smooth edges.
+   */
+  static BufferedImage buildDiagonalTexture(BufferedImage tileImg,
+                                            double tw, double th, double groutCm, Color groutC,
+                                            double offXcm, double offYcm, double [] sizeCm) {
+    double cw = tw + groutCm;
+    double ch = th + groutCm;
+    int bestP = 1;
+    int bestQ = 1;
+    double bestErr = Double.MAX_VALUE;
+    for (int p = 1; p <= 6; p++) {
+      for (int q = 1; q <= 6; q++) {
+        double err = Math.abs(ch / cw - (double)p / q) / (ch / cw);
+        if (err < bestErr - 1e-9) {
+          bestErr = err;
+          bestP = p;
+          bestQ = q;
+        }
+      }
+    }
+    if (bestErr > 0.01) {
+      throw new IllegalArgumentException("Diagonal layout needs a tile aspect ratio close to "
+          + "1:1, 1:2, 2:3... (within 1%). Use \"Custom tile size\" to adjust.");
+    }
+    double ch2 = cw * bestP / bestQ; // cell height adjusted to the exact ratio
+    double sqrt2 = Math.sqrt(2);
+    double P = sqrt2 * bestP * cw;   // period in cm (square)
+
+    double srcPpc = tileImg.getWidth() / tw;
+    double ppc = Math.max(1.0, Math.min(Math.min(srcPpc, 2048.0 / P), 16.0));
+    int S = Math.max(8, (int)Math.round(P * ppc));
+    int HS = 2 * S;
+    double ppcH = HS / P;
+
+    BufferedImage hi = new BufferedImage(HS, HS, BufferedImage.TYPE_INT_RGB);
+    Graphics2D g = hi.createGraphics();
+    g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+    g.setColor(groutC);
+    g.fillRect(0, 0, HS, HS);
+
+    double M = cw + ch2;
+    int i0 = (int)Math.floor(-2 * M / (sqrt2 * cw)) - 1;
+    int i1 = (int)Math.ceil((2 * P + 2 * M) / (sqrt2 * cw)) + 1;
+    int j0 = (int)Math.floor(-(P + 2 * M) / (sqrt2 * ch2)) - 1;
+    int j1 = (int)Math.ceil((P + 2 * M) / (sqrt2 * ch2)) + 1;
+    double sx = tw * ppcH / tileImg.getWidth();
+    double sy = th * ppcH / tileImg.getHeight();
+    double margin = M * ppcH;
+    for (int i = i0; i <= i1; i++) {
+      for (int j = j0; j <= j1; j++) {
+        double cx = (i * cw - j * ch2) / sqrt2 * ppcH;
+        double cy = (i * cw + j * ch2) / sqrt2 * ppcH;
+        if (cx < -margin || cx > HS + margin || cy < -margin || cy > HS + margin) {
+          continue;
+        }
+        AffineTransform at = new AffineTransform();
+        at.translate(cx, cy);
+        at.rotate(Math.PI / 4);
+        at.scale(sx, sy);
+        at.translate(-tileImg.getWidth() / 2.0, -tileImg.getHeight() / 2.0);
+        g.drawImage(tileImg, at, null);
+      }
+    }
+    g.dispose();
+
+    BufferedImage block = new BufferedImage(S, S, BufferedImage.TYPE_INT_RGB);
+    Graphics2D bg = block.createGraphics();
+    bg.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+    bg.drawImage(hi, 0, 0, S, S, null);
+    bg.dispose();
+
+    // start offset with wrap-around
+    int ox = (int)Math.round(offXcm * S / P);
+    int oy = (int)Math.round(offYcm * S / P);
+    ox = ((ox % S) + S) % S;
+    oy = ((oy % S) + S) % S;
+    BufferedImage result = block;
+    if (ox != 0 || oy != 0) {
+      result = new BufferedImage(S, S, BufferedImage.TYPE_INT_RGB);
+      Graphics2D sg = result.createGraphics();
+      for (int dx = 0; dx <= S; dx += S) {
+        for (int dy = 0; dy <= S; dy += S) {
+          sg.drawImage(block, dx - ox, dy - oy, null);
+        }
+      }
+      sg.dispose();
+    }
+    sizeCm[0] = P;
+    sizeCm[1] = P;
+    return result;
+  }
 
   /**
    * Builds one pattern period: 1 tile wide and m rows tall
