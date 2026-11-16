@@ -1,7 +1,9 @@
 import java.awt.Color;
 import java.awt.Component;
 import java.awt.Graphics2D;
-import java.awt.GridLayout;
+import java.awt.GridBagConstraints;
+import java.awt.GridBagLayout;
+import java.awt.Insets;
 import java.awt.RenderingHints;
 import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
@@ -30,6 +32,7 @@ import javax.imageio.metadata.IIOMetadata;
 import javax.imageio.metadata.IIOMetadataNode;
 import javax.imageio.stream.ImageInputStream;
 import javax.imageio.stream.ImageOutputStream;
+import javax.swing.ButtonGroup;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JColorChooser;
@@ -38,12 +41,14 @@ import javax.swing.JComponent;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
+import javax.swing.JRadioButton;
 import javax.swing.JSpinner;
 import javax.swing.SpinnerNumberModel;
 
 import org.w3c.dom.NamedNodeMap;
 import org.w3c.dom.Node;
 
+import com.eteks.sweethome3d.model.Camera;
 import com.eteks.sweethome3d.model.CatalogTexture;
 import com.eteks.sweethome3d.model.Content;
 import com.eteks.sweethome3d.model.HomeTexture;
@@ -59,7 +64,8 @@ import com.eteks.sweethome3d.tools.URLContent;
  *
  * Takes the texture applied to a wall side or floor (an image of a single tile), uses its
  * native size (width/height in cm, including scale) and builds a new texture from it with
- * grout (color, width), running bond (brick offset in % of tile width) and a start offset.
+ * grout (color, width), running bond (brick offset in % of tile width), a diagonal (45 degrees,
+ * "karo") layout, also with a brick shift for square tiles, and a start offset.
  * Only surfaces that have a texture are changed; plain colors are left alone.
  *
  * The original tile image is embedded in the generated PNG (tEXt chunks), so it survives
@@ -71,6 +77,12 @@ public class TilesPlugin extends Plugin {
   private static final String KEY_W = "tp-w";
   private static final String KEY_H = "tp-h";
   private static final String KEY_NAME = "tp-name";
+
+  // What the plugin changes (one at a time)
+  private static final int T_LEFT = 0;
+  private static final int T_RIGHT = 1;
+  private static final int T_NEAREST = 2;
+  private static final int T_FLOOR = 3;
 
   private final Preferences prefs = Preferences.userRoot().node("sh3d-tiles-plugin");
 
@@ -110,9 +122,11 @@ public class TilesPlugin extends Plugin {
 
   /** One textured surface: a wall side or a floor. */
   private abstract static class Surface {
-    final String kind; // "L", "R", "F"
-    Surface(String kind) {
+    final String kind;  // "L" (wall left side), "R" (wall right side), "F" (room floor)
+    final Wall wall;    // the wall for "L" / "R", else null
+    Surface(String kind, Wall wall) {
       this.kind = kind;
+      this.wall = wall;
     }
     abstract HomeTexture get();
     abstract void set(HomeTexture texture);
@@ -131,7 +145,12 @@ public class TilesPlugin extends Plugin {
   // ---------------------------------------------------------------- helpers
 
   private static JSpinner spinner(double value, double min, double max, double step) {
-    return new JSpinner(new SpinnerNumberModel(Math.max(min, Math.min(max, value)), min, max, step));
+    JSpinner s = new JSpinner(new SpinnerNumberModel(Math.max(min, Math.min(max, value)), min, max, step));
+    JComponent editor = s.getEditor();
+    if (editor instanceof JSpinner.DefaultEditor) {
+      ((JSpinner.DefaultEditor)editor).getTextField().setColumns(6); // narrow field
+    }
+    return s;
   }
 
   private static double val(JSpinner s) {
@@ -150,6 +169,33 @@ public class TilesPlugin extends Plugin {
       }
     });
     return b;
+  }
+
+  /** Adds "label  component" as one row of a GridBagLayout panel; the component keeps its own width. */
+  private static void addRow(JPanel p, int row, String label, JComponent comp) {
+    GridBagConstraints c = new GridBagConstraints();
+    c.gridx = 0;
+    c.gridy = row;
+    c.anchor = GridBagConstraints.WEST;
+    c.insets = new Insets(2, 0, 2, 14);
+    p.add(new JLabel(label), c);
+    c = new GridBagConstraints();
+    c.gridx = 1;
+    c.gridy = row;
+    c.anchor = GridBagConstraints.WEST;
+    c.insets = new Insets(2, 0, 2, 0);
+    p.add(comp, c);
+  }
+
+  /** Adds a component spanning both columns. */
+  private static void addWide(JPanel p, int row, JComponent comp) {
+    GridBagConstraints c = new GridBagConstraints();
+    c.gridx = 0;
+    c.gridy = row;
+    c.gridwidth = 2;
+    c.anchor = GridBagConstraints.WEST;
+    c.insets = new Insets(2, 0, 2, 0);
+    p.add(comp, c);
   }
 
   /** Texture scale (HomeTexture.getScale) read by reflection so the code compiles on older APIs too. */
@@ -186,23 +232,50 @@ public class TilesPlugin extends Plugin {
     for (Selectable s : getHome().getSelectedItems()) {
       if (s instanceof Wall) {
         final Wall w = (Wall)s;
-        surfaces.add(new Surface("L") {
+        surfaces.add(new Surface("L", w) {
           HomeTexture get() { return w.getLeftSideTexture(); }
           void set(HomeTexture t) { w.setLeftSideTexture(t); }
         });
-        surfaces.add(new Surface("R") {
+        surfaces.add(new Surface("R", w) {
           HomeTexture get() { return w.getRightSideTexture(); }
           void set(HomeTexture t) { w.setRightSideTexture(t); }
         });
       } else if (s instanceof Room) {
         final Room r = (Room)s;
-        surfaces.add(new Surface("F") {
+        surfaces.add(new Surface("F", null) {
           HomeTexture get() { return r.getFloorTexture(); }
           void set(HomeTexture t) { r.setFloorTexture(t); }
         });
       }
     }
     return surfaces;
+  }
+
+  /**
+   * Which side of the wall ("L" or "R") is nearer to the viewer, judged by the current camera
+   * position in the plan. "Left" is the left side when going from the wall start to its end.
+   */
+  private String sideNearestToViewer(Wall w) {
+    Camera camera = getHome().getCamera();
+    double dx = w.getXEnd() - w.getXStart();
+    double dy = w.getYEnd() - w.getYStart();
+    double cross = dx * (camera.getY() - w.getYStart()) - dy * (camera.getX() - w.getXStart());
+    return cross < 0 ? "L" : "R";
+  }
+
+  private boolean matchesTarget(Surface sf, int target) {
+    switch (target) {
+      case T_LEFT:
+        return "L".equals(sf.kind);
+      case T_RIGHT:
+        return "R".equals(sf.kind);
+      case T_NEAREST:
+        return sf.wall != null && sf.kind.equals(sideNearestToViewer(sf.wall));
+      case T_FLOOR:
+        return "F".equals(sf.kind);
+      default:
+        return false;
+    }
   }
 
   // ---------------------------------------------------------------- origin tracking
@@ -327,21 +400,22 @@ public class TilesPlugin extends Plugin {
   private void showDialog() {
     Component parent = parentComponent();
 
-    // Only surfaces that have a texture; plain colors are left alone
-    List<Surface> surfaces = new ArrayList<Surface>();
-    for (Surface sf : collectSurfaces()) {
+    List<Surface> all = collectSurfaces();
+    Surface firstTextured = null;
+    for (Surface sf : all) {
       if (sf.get() != null) {
-        surfaces.add(sf);
+        firstTextured = sf;
+        break;
       }
     }
-    if (surfaces.isEmpty()) {
+    if (firstTextured == null) {
       JOptionPane.showMessageDialog(parent,
           "Select walls or rooms that have a texture applied (surfaces with only a color are ignored).");
       return;
     }
 
     // Default tile size = native size of the first texture found
-    Origin first = resolve(surfaces.get(0).get());
+    Origin first = resolve(firstTextured.get());
     double defW = Math.round(first.wCm * 10) / 10.0;
     double defH = Math.round(first.hCm * 10) / 10.0;
 
@@ -357,34 +431,52 @@ public class TilesPlugin extends Plugin {
     JSpinner brick = spinner(prefs.getDouble("brickPct", 0), 0, 99, 5);
     JSpinner offX = spinner(prefs.getDouble("offX", 0), -1000, 1000, 1);
     JSpinner offY = spinner(prefs.getDouble("offY", 0), -1000, 1000, 1);
-    JComboBox<String> layoutRot = new JComboBox<String>(new String [] {
+    JComboBox<String> layoutBox = new JComboBox<String>(new String [] {
         "Straight, horizontal rows", "Straight, vertical rows", "Diagonal (45°, karo)"});
-    layoutRot.setSelectedIndex(Math.max(0, Math.min(2, prefs.getInt("layoutRot", 0))));
+    layoutBox.setSelectedIndex(Math.max(0, Math.min(2, prefs.getInt("layoutRot", 0))));
 
     final Color [] groutHolder = {new Color(prefs.getInt("groutColor", 0x9A9A9A))};
     JButton groutBtn = colorButton(groutHolder);
 
-    JCheckBox wallLeft = new JCheckBox("Walls: left side", prefs.getBoolean("wallLeft", true));
-    JCheckBox wallRight = new JCheckBox("Walls: right side", prefs.getBoolean("wallRight", true));
-    JCheckBox floorBox = new JCheckBox("Rooms: floor", prefs.getBoolean("floor", true));
+    int targetInit = Math.max(0, Math.min(3, prefs.getInt("target", T_NEAREST)));
+    JRadioButton [] targetButtons = {
+        new JRadioButton("Wall: left side"),
+        new JRadioButton("Wall: right side"),
+        new JRadioButton("Wall: side nearest to the viewer (camera)"),
+        new JRadioButton("Room: floor")};
+    ButtonGroup group = new ButtonGroup();
+    for (JRadioButton rb : targetButtons) {
+      group.add(rb);
+    }
+    targetButtons[targetInit].setSelected(true);
 
-    JPanel p = new JPanel(new GridLayout(0, 2, 8, 4));
-    p.add(customSize); p.add(new JLabel(""));
-    p.add(new JLabel("Tile width (cm)")); p.add(tileW);
-    p.add(new JLabel("Tile height (cm)")); p.add(tileH);
-    p.add(new JLabel("Grout width (mm)")); p.add(grout);
-    p.add(new JLabel("Grout color")); p.add(groutBtn);
-    p.add(new JLabel("Brick row shift (% of tile, 0 = straight; not for diagonal)")); p.add(brick);
-    p.add(new JLabel("Start offset X (cm)")); p.add(offX);
-    p.add(new JLabel("Start offset Y (cm)")); p.add(offY);
-    p.add(new JLabel("Layout")); p.add(layoutRot);
-    p.add(wallLeft); p.add(wallRight);
-    p.add(floorBox); p.add(new JLabel(""));
+    JPanel p = new JPanel(new GridBagLayout());
+    int row = 0;
+    addWide(p, row++, customSize);
+    addRow(p, row++, "Tile width (cm)", tileW);
+    addRow(p, row++, "Tile height (cm)", tileH);
+    addRow(p, row++, "Grout width (mm)", grout);
+    addRow(p, row++, "Grout color", groutBtn);
+    addRow(p, row++, "Brick row shift (% of tile, 0 = none)", brick);
+    addRow(p, row++, "Start offset X (cm)", offX);
+    addRow(p, row++, "Start offset Y (cm)", offY);
+    addRow(p, row++, "Layout", layoutBox);
+    addWide(p, row++, new JLabel("Change (one at a time):"));
+    for (JRadioButton rb : targetButtons) {
+      addWide(p, row++, rb);
+    }
 
     int res = JOptionPane.showConfirmDialog(parent, p, "Tiles with grout",
         JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
     if (res != JOptionPane.OK_OPTION) {
       return;
+    }
+
+    int target = T_NEAREST;
+    for (int i = 0; i < targetButtons.length; i++) {
+      if (targetButtons[i].isSelected()) {
+        target = i;
+      }
     }
 
     // Remember the values
@@ -395,29 +487,68 @@ public class TilesPlugin extends Plugin {
     prefs.putDouble("brickPct", val(brick));
     prefs.putDouble("offX", val(offX));
     prefs.putDouble("offY", val(offY));
-    prefs.putInt("layoutRot", layoutRot.getSelectedIndex());
+    prefs.putInt("layoutRot", layoutBox.getSelectedIndex());
     prefs.putInt("groutColor", groutHolder[0].getRGB() & 0xFFFFFF);
-    prefs.putBoolean("wallLeft", wallLeft.isSelected());
-    prefs.putBoolean("wallRight", wallRight.isSelected());
-    prefs.putBoolean("floor", floorBox.isSelected());
+    prefs.putInt("target", target);
+
+    // Surfaces to change: textured ones matching the chosen target
+    List<Surface> targets = new ArrayList<Surface>();
+    for (Surface sf : all) {
+      if (sf.get() != null && matchesTarget(sf, target)) {
+        targets.add(sf);
+      }
+    }
+    if (targets.isEmpty()) {
+      JOptionPane.showMessageDialog(parent,
+          "Nothing to change: no textured surface in the selection matches the chosen target\n"
+          + "(surfaces with only a color are skipped).");
+      return;
+    }
 
     Color groutColor = groutHolder[0];
     double groutCm = val(grout) / 10.0;
     double brickFrac = val(brick) / 100.0;
-    final int layout = layoutRot.getSelectedIndex(); // 0 horizontal, 1 vertical, 2 diagonal
+    final int layout = layoutBox.getSelectedIndex(); // 0 horizontal, 1 vertical, 2 diagonal
     boolean rotateLayout = layout == 1;
-    String suffix = " grout " + val(grout) + "mm"
-        + (layout == 2 ? " diagonal" : (brickFrac > 0 ? " brick " + (int)val(brick) + "%" : ""));
+
+    // Diagonal layout with a brick shift: square tiles and a shift that repeats seamlessly
+    int brickR = 0;
+    int brickS = 0;
+    if (layout == 2 && brickFrac > 0.001) {
+      int [] rs = diagonalBrick(brickFrac);
+      if (rs == null) {
+        JOptionPane.showMessageDialog(parent,
+            "A brick shift of " + (int)Math.round(val(brick)) + "% cannot repeat seamlessly in the diagonal layout.\n"
+            + "Use a shift such as 50, 33, 25, 20, 17, 14 or 12.5 (or 0 for no shift).");
+        return;
+      }
+      brickR = rs[0];
+      brickS = rs[1];
+      for (Surface sf : targets) {
+        Origin o = resolve(sf.get());
+        double tw = customSize.isSelected() ? val(tileW) : o.wCm;
+        double th = customSize.isSelected() ? val(tileH) : o.hCm;
+        if (Math.abs(tw - th) > 0.01 * Math.max(tw, th)) {
+          JOptionPane.showMessageDialog(parent,
+              "The diagonal layout with a brick shift needs square tiles.\n"
+              + "This tile is " + Math.round(tw * 10) / 10.0 + " x " + Math.round(th * 10) / 10.0 + " cm.\n"
+              + "Use a square tile (or a custom square size), or set the brick shift to 0.");
+          return;
+        }
+      }
+    }
+
+    String suffix = " grout " + val(grout) + "mm";
+    if (layout == 2) {
+      suffix += " diagonal" + (brickS > 0 ? " brick " + brickR + "/" + brickS : "");
+    } else if (brickFrac > 0) {
+      suffix += " brick " + (int)Math.round(val(brick)) + "%";
+    }
 
     Map<Origin, HomeTexture> cache = new IdentityHashMap<Origin, HomeTexture>();
     int count = 0;
     try {
-      for (Surface sf : surfaces) {
-        if (("L".equals(sf.kind) && !wallLeft.isSelected())
-            || ("R".equals(sf.kind) && !wallRight.isSelected())
-            || ("F".equals(sf.kind) && !floorBox.isSelected())) {
-          continue;
-        }
+      for (Surface sf : targets) {
         Origin origin = resolve(sf.get());
         HomeTexture result = cache.get(origin);
         if (result == null) {
@@ -432,7 +563,7 @@ public class TilesPlugin extends Plugin {
           BufferedImage image;
           if (layout == 2) {
             image = buildDiagonalTexture(tileImg, tw, th, groutCm, groutColor,
-                val(offX), val(offY), sizeCm);
+                brickR, brickS, val(offX), val(offY), sizeCm);
           } else {
             image = buildTexture(tileImg, tw, th, groutCm, groutColor,
                 brickFrac, val(offX), val(offY), rotateLayout, sizeCm);
@@ -465,6 +596,9 @@ public class TilesPlugin extends Plugin {
         sf.set(result);
         count++;
       }
+    } catch (IllegalArgumentException ex) {
+      JOptionPane.showMessageDialog(parent, ex.getMessage());
+      return;
     } catch (Exception ex) {
       JOptionPane.showMessageDialog(parent, "Error: " + ex);
       return;
@@ -519,39 +653,75 @@ public class TilesPlugin extends Plugin {
   // ---------------------------------------------------------------- texture generation
 
   /**
-   * Diagonal ("karo") layout: tiles rotated by 45 degrees.
-   * The 45-degree tile lattice repeats on an axis-aligned square of side sqrt(2) * p * cw,
-   * where (tile height + grout) / (tile width + grout) = p / q for small integers p, q
-   * (1:1 squares, 1:2, 2:3 ... within 1%). Rendered at 2x and downscaled for smooth edges.
+   * Finds r/s (2 <= s <= 8) close to the brick shift fraction, or null if there is none.
+   * Only such shifts repeat seamlessly in the diagonal layout.
    */
-  static BufferedImage buildDiagonalTexture(BufferedImage tileImg,
-                                            double tw, double th, double groutCm, Color groutC,
-                                            double offXcm, double offYcm, double [] sizeCm) {
-    double cw = tw + groutCm;
-    double ch = th + groutCm;
-    int bestP = 1;
-    int bestQ = 1;
-    double bestErr = Double.MAX_VALUE;
-    for (int p = 1; p <= 6; p++) {
-      for (int q = 1; q <= 6; q++) {
-        double err = Math.abs(ch / cw - (double)p / q) / (ch / cw);
-        if (err < bestErr - 1e-9) {
-          bestErr = err;
-          bestP = p;
-          bestQ = q;
+  static int [] diagonalBrick(double fraction) {
+    for (int s = 2; s <= 8; s++) {
+      for (int r = 1; r < s; r++) {
+        if (Math.abs(fraction - (double)r / s) <= 0.01) {
+          return new int [] {r, s};
         }
       }
     }
-    if (bestErr > 0.01) {
-      throw new IllegalArgumentException("Diagonal layout needs a tile aspect ratio close to "
-          + "1:1, 1:2, 2:3... (within 1%). Use \"Custom tile size\" to adjust.");
+    return null;
+  }
+
+  /**
+   * Diagonal ("karo") layout: tiles rotated by 45 degrees.
+   *
+   * Without a brick shift (brickS == 0) the pattern repeats on an axis-aligned square of side
+   * sqrt(2) * p * cw, where (tile height + grout) / (tile width + grout) = p / q for small
+   * integers p, q (1:1, 1:2, 2:3 ... within 1%).
+   *
+   * With a brick shift of brickR / brickS of the tile width (square tiles only) every next row is
+   * shifted along the row direction, and the pattern repeats on a square of side
+   * sqrt(2) * brickS * cw.
+   *
+   * Rendered at 2x and downscaled for smooth edges.
+   */
+  static BufferedImage buildDiagonalTexture(BufferedImage tileImg,
+                                            double tw, double th, double groutCm, Color groutC,
+                                            int brickR, int brickS,
+                                            double offXcm, double offYcm, double [] sizeCm) {
+    double cw = tw + groutCm;
+    double ch = th + groutCm;
+    double f = 0;
+    double ch2;   // cell height adjusted to the exact lattice
+    int K;        // period = sqrt(2) * K * cw
+    if (brickS > 0) {
+      if (Math.abs(tw - th) > 0.01 * Math.max(tw, th)) {
+        throw new IllegalArgumentException("The diagonal layout with a brick shift needs square tiles.");
+      }
+      ch2 = cw;
+      f = (double)brickR / brickS;
+      K = brickS;
+    } else {
+      int bestP = 1;
+      int bestQ = 1;
+      double bestErr = Double.MAX_VALUE;
+      for (int p = 1; p <= 6; p++) {
+        for (int q = 1; q <= 6; q++) {
+          double err = Math.abs(ch / cw - (double)p / q) / (ch / cw);
+          if (err < bestErr - 1e-9) {
+            bestErr = err;
+            bestP = p;
+            bestQ = q;
+          }
+        }
+      }
+      if (bestErr > 0.01) {
+        throw new IllegalArgumentException("The diagonal layout needs a tile aspect ratio close to "
+            + "1:1, 1:2, 2:3... (within 1%).\nUse \"Custom tile size\" to adjust.");
+      }
+      ch2 = cw * bestP / bestQ;
+      K = bestP;
     }
-    double ch2 = cw * bestP / bestQ; // cell height adjusted to the exact ratio
     double sqrt2 = Math.sqrt(2);
-    double P = sqrt2 * bestP * cw;   // period in cm (square)
+    double P = sqrt2 * K * cw;   // period in cm (square)
 
     double srcPpc = tileImg.getWidth() / tw;
-    double ppc = Math.max(1.0, Math.min(Math.min(srcPpc, 2048.0 / P), 16.0));
+    double ppc = Math.max(1.0, Math.min(Math.min(srcPpc, 1536.0 / P), 16.0));
     int S = Math.max(8, (int)Math.round(P * ppc));
     int HS = 2 * S;
     double ppcH = HS / P;
@@ -562,18 +732,38 @@ public class TilesPlugin extends Plugin {
     g.setColor(groutC);
     g.fillRect(0, 0, HS, HS);
 
+    // Tile centers (cm): i * a + j * b, with a = cw * (1, 1) / sqrt2 and
+    // b = ((-ch2 + f * cw), (ch2 + f * cw)) / sqrt2  (row j shifted by j * f * cw along the row)
     double M = cw + ch2;
-    int i0 = (int)Math.floor(-2 * M / (sqrt2 * cw)) - 1;
-    int i1 = (int)Math.ceil((2 * P + 2 * M) / (sqrt2 * cw)) + 1;
-    int j0 = (int)Math.floor(-(P + 2 * M) / (sqrt2 * ch2)) - 1;
-    int j1 = (int)Math.ceil((P + 2 * M) / (sqrt2 * ch2)) + 1;
+    double lo = -M;
+    double hiCm = P + M;
+    double [][] corners = {{lo, lo}, {lo, hiCm}, {hiCm, lo}, {hiCm, hiCm}};
+    int i0 = Integer.MAX_VALUE;
+    int i1 = Integer.MIN_VALUE;
+    int j0 = Integer.MAX_VALUE;
+    int j1 = Integer.MIN_VALUE;
+    for (double [] pt : corners) {
+      double X = sqrt2 * pt[0];
+      double Y = sqrt2 * pt[1];
+      double jj = (Y - X) / (2 * ch2);
+      double ii = (X - jj * (-ch2 + f * cw)) / cw;
+      i0 = Math.min(i0, (int)Math.floor(ii));
+      i1 = Math.max(i1, (int)Math.ceil(ii));
+      j0 = Math.min(j0, (int)Math.floor(jj));
+      j1 = Math.max(j1, (int)Math.ceil(jj));
+    }
+    i0 -= 1;
+    i1 += 1;
+    j0 -= 1;
+    j1 += 1;
+
     double sx = tw * ppcH / tileImg.getWidth();
     double sy = th * ppcH / tileImg.getHeight();
     double margin = M * ppcH;
     for (int i = i0; i <= i1; i++) {
       for (int j = j0; j <= j1; j++) {
-        double cx = (i * cw - j * ch2) / sqrt2 * ppcH;
-        double cy = (i * cw + j * ch2) / sqrt2 * ppcH;
+        double cx = (i * cw + j * (-ch2 + f * cw)) / sqrt2 * ppcH;
+        double cy = (i * cw + j * (ch2 + f * cw)) / sqrt2 * ppcH;
         if (cx < -margin || cx > HS + margin || cy < -margin || cy > HS + margin) {
           continue;
         }
